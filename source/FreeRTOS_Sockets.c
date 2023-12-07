@@ -57,6 +57,8 @@
     #include "tcp_mem_stats.h"
 #endif
 
+#include "dlog.h"
+
 /* The ItemValue of the sockets xBoundSocketListItem member holds the socket's
  * port number. */
 /** @brief Set the port number for the socket in the xBoundSocketListItem. */
@@ -3689,13 +3691,14 @@ void vSocketWakeUpUser( FreeRTOS_Socket_t * pxSocket )
             /* Check if it makes any sense to wait for a connect event, this condition
              * might change while sleeping, so it must be checked within each loop */
             xResult = bMayConnect( pxSocket ); /* -EINPROGRESS, -EAGAIN, or 0 for OK */
-
+d("");
             /* Start the connect procedure, kernel will start working on it */
             if( xResult == 0 )
             {
                 pxSocket->u.xTCP.bits.bConnPrepared = pdFALSE;
                 pxSocket->u.xTCP.ucRepCount = 0U;
 
+d("fam:%d", pxAddress->sin_family);
                 switch( pxAddress->sin_family )
                 {
                     #if ( ipconfigUSE_IPv6 != 0 )
@@ -3711,6 +3714,8 @@ void vSocketWakeUpUser( FreeRTOS_Socket_t * pxSocket )
                     #if ( ipconfigUSE_IPv4 != 0 )
                         case FREERTOS_AF_INET4:
                             pxSocket->bits.bIsIPv6 = pdFALSE_UNSIGNED;
+                            d(  "FreeRTOS_connect: lp:%u -> %x:%u",
+                                               pxSocket->usLocalPort, ( unsigned int ) FreeRTOS_ntohl( pxAddress->sin_address.ulIP_IPv4 ), FreeRTOS_ntohs( pxAddress->sin_port ) ) ;
                             FreeRTOS_printf( ( "FreeRTOS_connect: %u to %xip:%u\n",
                                                pxSocket->usLocalPort, ( unsigned int ) FreeRTOS_ntohl( pxAddress->sin_address.ulIP_IPv4 ), FreeRTOS_ntohs( pxAddress->sin_port ) ) );
                             pxSocket->u.xTCP.xRemoteIP.ulIP_IPv4 = FreeRTOS_ntohl( pxAddress->sin_address.ulIP_IPv4 );
@@ -3733,6 +3738,7 @@ void vSocketWakeUpUser( FreeRTOS_Socket_t * pxSocket )
 
                 if( xSendEventToIPTask( eTCPTimerEvent ) != pdPASS )
                 {
+d("");
                     xResult = -pdFREERTOS_ERRNO_ECANCELED;
                 }
             }
@@ -3774,6 +3780,7 @@ void vSocketWakeUpUser( FreeRTOS_Socket_t * pxSocket )
         #if ( ipconfigIPv4_BACKWARD_COMPATIBLE == 1 )
             struct freertos_sockaddr xTempAddress;
 
+d("");
             if( ( pxAddress != NULL ) && ( pxAddress->sin_family != FREERTOS_AF_INET6 ) && ( pxAddress->sin_family != FREERTOS_AF_INET ) )
             {
                 ( void ) memcpy( &xTempAddress, pxAddress, sizeof( struct freertos_sockaddr ) );
@@ -3787,6 +3794,7 @@ void vSocketWakeUpUser( FreeRTOS_Socket_t * pxSocket )
 
         xResult = prvTCPConnectStart( pxSocket, pxAddress );
 
+d("prvTCPConnectStart:%ld", (int32_t)xResult);
         if( xResult == 0 )
         {
             /* And wait for the result */

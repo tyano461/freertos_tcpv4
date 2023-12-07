@@ -282,7 +282,10 @@
 
             ( void ) memset( pxAddrInfo, 0, sizeof( *pxAddrInfo ) );
             pxAddrInfo->ai_canonname = pxAddrInfo->xPrivateStorage.ucName;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
             ( void ) strncpy( pxAddrInfo->xPrivateStorage.ucName, pcName, sizeof( pxAddrInfo->xPrivateStorage.ucName ) );
+#pragma GCC diagnostic pop
 
             pxAddrInfo->ai_addr = ( ( struct freertos_sockaddr * ) &( pxAddrInfo->xPrivateStorage.sockaddr ) );
 

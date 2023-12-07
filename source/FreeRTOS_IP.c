@@ -60,6 +60,8 @@
 #include "FreeRTOS_Routing.h"
 #include "FreeRTOS_ND.h"
 
+#include "dlog.h"
+
 /** @brief Time delay between repeated attempts to initialise the network hardware. */
 #ifndef ipINITIALISATION_RETRY_DELAY
     #define ipINITIALISATION_RETRY_DELAY    ( pdMS_TO_TICKS( 3000U ) )
@@ -1392,6 +1394,7 @@ BaseType_t xSendEventStructToIPTask( const IPStackEvent_t * pxEvent,
 
         #if ( ipconfigUSE_TCP == 1 )
             {
+d("et:%ld", (int32_t)pxEvent->eEventType );
                 if( pxEvent->eEventType == eTCPTimerEvent )
                 {
                     /* TCP timer events are sent to wake the timer task when
