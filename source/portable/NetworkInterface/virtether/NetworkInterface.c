@@ -63,6 +63,9 @@ static void ether_task(void *param);
 
 /* variables */
 TaskHandle_t ether_handle;
+NetworkBufferDescriptor_t g_desc;
+ARPPacket_t g_arp;
+static MACAddress_t connectedMac = {.ucBytes = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}};
 
 BaseType_t xNetworkInterfaceInitialise(void)
 {
@@ -122,10 +125,19 @@ uint32_t ulApplicationGetNextSequenceNumber(uint32_t ulSourceAddress,
 struct xNetworkInterface *pxFillInterfaceDescriptor(BaseType_t xEMACIndex,
                                                     struct xNetworkInterface *pxInterface)
 {
+    NetworkEndPoint_t *ep;
     static char eth_name[0x11];
+
     snprintf(eth_name, sizeof(eth_name), "eth%ld", xEMACIndex);
     d("mac:%lx", (uint32_t)xEMACIndex);
+
     xTaskCreate(ether_task, "ether_task", 100, NULL, configMAX_PRIORITIES - 1, &ether_handle);
+    ep = FreeRTOS_FirstEndPoint(pxInterface);
+    while (ep)
+    {
+        d("epmac:%s", b2s(ep->xMACAddress.ucBytes, 6));
+        ep = FreeRTOS_NextEndPoint(pxInterface, ep);
+    }
     pxInterface->pcName = eth_name;
     pxInterface->pvArgument = (void *)xEMACIndex;
     pxInterface->pfInitialise = pfInitialise;
@@ -145,10 +157,16 @@ static BaseType_t pfOutput(struct xNetworkInterface *pxDescriptor,
                            NetworkBufferDescriptor_t *const pxNetworkBuffer,
                            BaseType_t xReleaseAfterSend)
 {
-    (void)pxDescriptor;
-    (void)pxNetworkBuffer;
+    ARPPacket_t *arp;
     (void)xReleaseAfterSend;
-    d("");
+    arp = (ARPPacket_t *)pxNetworkBuffer->pucEthernetBuffer;
+    if (arp->xARPHeader.usOperation == ipARP_REQUEST)
+    {
+        memcpy(&g_desc, pxDescriptor, sizeof(NetworkBufferDescriptor_t));
+        memcpy(&g_arp, arp, sizeof(ARPPacket_t));
+        vTaskResume(ether_handle);
+    }
+    d("ip:%lx po:%x bp:%x len:%u data:%s r:%ld", pxNetworkBuffer->xIPAddress.ulIP_IPv4, pxNetworkBuffer->usPort, pxNetworkBuffer->usBoundPort, pxNetworkBuffer->xDataLength, b2s(pxNetworkBuffer->pucEthernetBuffer, pxNetworkBuffer->xDataLength), xReleaseAfterSend);
     return pdPASS;
 }
 
@@ -161,23 +179,57 @@ static BaseType_t pfGetPhyLinkStatus(struct xNetworkInterface *pxDescriptor)
 
 static void ether_task(void *param)
 {
-    NetworkBufferDescriptor_t *descriptor;
-    // int32_t received;
+    static NetworkBufferDescriptor_t *descriptor;
+    ARPPacket_t *arp;
+    ARPHeader_t *ah;
+    EthernetHeader_t *eth;
     IPStackEvent_t ev;
-    // uint8_t *buf;
+    MACAddress_t mac;
+    uint32_t from, addr;
 
     (void)param;
     d("");
     for (;;)
     {
-        descriptor = pxGetNetworkBufferWithDescriptor(4, 0);
+        vTaskSuspend(NULL);
+        descriptor = pxGetNetworkBufferWithDescriptor(sizeof(ARPPacket_t), 0);
         if (descriptor)
         {
-            d("i:%p ep:%p ip:%lx po:%u bp:%u", descriptor->pxInterface, descriptor->pxEndPoint, (uint32_t)descriptor->xIPAddress.ulIP_IPv4, descriptor->usPort, descriptor->usBoundPort);
             ev.eEventType = eNetworkRxEvent;
+            memcpy(descriptor, &g_desc, sizeof(NetworkBufferDescriptor_t));
+            descriptor->pucEthernetBuffer = (uint8_t *)&g_arp;
             ev.pvData = descriptor;
-            xSendEventStructToIPTask(&ev, 0);
+            arp = (ARPPacket_t *)descriptor->pucEthernetBuffer;
+            ah = &arp->xARPHeader;
+            eth = &arp->xEthernetHeader;
+            if (ah->usOperation == ipARP_REQUEST)
+            {
+                mac = ah->xSenderHardwareAddress;
+                from = *(uint32_t *)ah->ucSenderProtocolAddress;
+                addr = ah->ulTargetProtocolAddress;
+
+                ah->usOperation = ipARP_REPLY;
+                ah->xSenderHardwareAddress = connectedMac;
+                memcpy(ah->ucSenderProtocolAddress, &addr, sizeof(addr));
+                ah->ulTargetProtocolAddress = from;
+                ah->xTargetHardwareAddress = mac;
+
+                eth->xDestinationAddress = mac;
+                eth->xSourceAddress = connectedMac;
+
+                d("send %s", b2s(arp, sizeof(ARPPacket_t)));
+                xSendEventStructToIPTask(&ev, 0);
+            }
+            else
+            {
+                d("arp op:%d", arp->xARPHeader.usOperation);
+            }
+
+            descriptor = NULL;
         }
-        vTaskDelay(1000);
+        else
+        {
+            d("descriptor is null");
+        }
     }
 }
