@@ -38,6 +38,7 @@
 /* FreeRTOS includes. */
 #include "FreeRTOS.h"
 #include "list.h"
+#include <stdbool.h>
 
 /* FreeRTOS+TCP includes. */
 #include "FreeRTOS_IP.h"
@@ -52,6 +53,7 @@
 #else
 #define ipCONSIDER_FRAME_FOR_PROCESSING(pucEthernetBuffer) eConsiderFrameForProcessing((pucEthernetBuffer))
 #endif
+#define ET_STATUS *(uint32_t *)0x28000100
 
 /* functions */
 static BaseType_t pfInitialise(struct xNetworkInterface *pxDescriptor);
@@ -60,12 +62,17 @@ static BaseType_t pfOutput(struct xNetworkInterface *pxDescriptor,
                            BaseType_t xReleaseAfterSend);
 static BaseType_t pfGetPhyLinkStatus(struct xNetworkInterface *pxDescriptor);
 static void ether_task(void *param);
+static void mmio_write_on(void);
+static void mmio_write_off(void);
+static void mmio_write(uint32_t offset, uint8_t *data, uint32_t len);
+static void mmio_read(uint32_t offset, uint8_t *data, uint32_t len);
+static bool ether_task_is_sleeping();
 
 /* variables */
 TaskHandle_t ether_handle;
 NetworkBufferDescriptor_t g_desc;
 ARPPacket_t g_arp;
-static MACAddress_t connectedMac = {.ucBytes = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55}};
+static MACAddress_t connectedMac = {.ucBytes = {0x01, 0x12, 0x23, 0x34, 0x45, 0x56}};
 
 BaseType_t xNetworkInterfaceInitialise(void)
 {
@@ -159,14 +166,30 @@ static BaseType_t pfOutput(struct xNetworkInterface *pxDescriptor,
 {
     ARPPacket_t *arp;
     (void)xReleaseAfterSend;
+    bool wakeup = false;
+    static TaskHandle_t handle = NULL;
+    if (!handle)
+    {
+        *(uint32_t *)0x28000200 = (uint32_t)ether_handle;
+    }
+    handle = (TaskHandle_t) * (uint32_t *)0x28000200;
+
     arp = (ARPPacket_t *)pxNetworkBuffer->pucEthernetBuffer;
     if (arp->xARPHeader.usOperation == ipARP_REQUEST)
     {
-        memcpy(&g_desc, pxDescriptor, sizeof(NetworkBufferDescriptor_t));
-        memcpy(&g_arp, arp, sizeof(ARPPacket_t));
-        vTaskResume(ether_handle);
+        d("arp request et:%d h:%p", ether_task_is_sleeping(), handle);
+        mmio_write_on();
+        mmio_write(0, (uint8_t *)pxDescriptor, sizeof(NetworkBufferDescriptor_t));
+        mmio_write(sizeof(NetworkBufferDescriptor_t), (uint8_t *)arp, sizeof(ARPPacket_t));
+        mmio_write_off();
+        if (ether_task_is_sleeping())
+        {
+            wakeup = true;
+            vTaskResume(handle);
+            vTaskDelay(1);
+        }
     }
-    d("ip:%lx po:%x bp:%x len:%u data:%s r:%ld", pxNetworkBuffer->xIPAddress.ulIP_IPv4, pxNetworkBuffer->usPort, pxNetworkBuffer->usBoundPort, pxNetworkBuffer->xDataLength, b2s(pxNetworkBuffer->pucEthernetBuffer, pxNetworkBuffer->xDataLength), xReleaseAfterSend);
+    d("ip:%lx po:%x bp:%x len:%u r:%ld wk:%d data:\n%s", pxNetworkBuffer->xIPAddress.ulIP_IPv4, pxNetworkBuffer->usPort, pxNetworkBuffer->usBoundPort, pxNetworkBuffer->xDataLength, xReleaseAfterSend, wakeup, b2s(pxNetworkBuffer->pucEthernetBuffer, pxNetworkBuffer->xDataLength));
     return pdPASS;
 }
 
@@ -175,6 +198,11 @@ static BaseType_t pfGetPhyLinkStatus(struct xNetworkInterface *pxDescriptor)
     (void)pxDescriptor;
     d("");
     return pdPASS;
+}
+
+static bool ether_task_is_sleeping()
+{
+    return ET_STATUS != 0;
 }
 
 static void ether_task(void *param)
@@ -186,17 +214,25 @@ static void ether_task(void *param)
     IPStackEvent_t ev;
     MACAddress_t mac;
     uint32_t from, addr;
+    BaseType_t status;
 
     (void)param;
-    d("");
+
     for (;;)
     {
+        ET_STATUS = 1;
+        d("sleep");
         vTaskSuspend(NULL);
+        d("wakeup");
+        ET_STATUS = 0;
+        vTaskDelay(10);
+
         descriptor = pxGetNetworkBufferWithDescriptor(sizeof(ARPPacket_t), 0);
         if (descriptor)
         {
+            mmio_read(0, (uint8_t *)descriptor, sizeof(NetworkBufferDescriptor_t));
+            mmio_read(sizeof(NetworkBufferDescriptor_t), (uint8_t *)&g_arp, sizeof(ARPPacket_t));
             ev.eEventType = eNetworkRxEvent;
-            memcpy(descriptor, &g_desc, sizeof(NetworkBufferDescriptor_t));
             descriptor->pucEthernetBuffer = (uint8_t *)&g_arp;
             ev.pvData = descriptor;
             arp = (ARPPacket_t *)descriptor->pucEthernetBuffer;
@@ -217,8 +253,9 @@ static void ether_task(void *param)
                 eth->xDestinationAddress = mac;
                 eth->xSourceAddress = connectedMac;
 
-                d("send %s", b2s(arp, sizeof(ARPPacket_t)));
-                xSendEventStructToIPTask(&ev, 0);
+                d("send \n%s", b2s(arp, sizeof(ARPPacket_t)));
+                status = xSendEventStructToIPTask(&ev, 0);
+                d("st:%ld", status);
             }
             else
             {
@@ -232,4 +269,34 @@ static void ether_task(void *param)
             d("descriptor is null");
         }
     }
+}
+
+/* MMIO */
+#define WRITE_MMIO_REG 0x28000000
+#define WRITE_DATA_BASE (uint8_t *)0x28000010
+#define write_set(s) *(uint32_t *)WRITE_MMIO_REG = s
+
+static void mmio_write_on(void)
+{
+    write_set(1);
+}
+
+static void mmio_write_off(void)
+{
+    write_set(0);
+}
+
+static void mmio_write(uint32_t offset, uint8_t *data, uint32_t len)
+{
+    memcpy(WRITE_DATA_BASE + offset, data, len);
+}
+
+static void mmio_read(uint32_t offset, uint8_t *data, uint32_t len)
+{
+    memcpy(data, WRITE_DATA_BASE + offset, len);
+}
+
+void ether_rx_handler(void)
+{
+    d("");
 }
