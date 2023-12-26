@@ -64,6 +64,8 @@ static BaseType_t pfOutput(struct xNetworkInterface *pxDescriptor,
                            BaseType_t xReleaseAfterSend);
 static BaseType_t pfGetPhyLinkStatus(struct xNetworkInterface *pxDescriptor);
 static void ether_task(void *param);
+static bool is_arp_request(uint8_t *data, size_t len);
+static void arp_reply(uint8_t *data, size_t len);
 static void mmio_write_on(void);
 static void mmio_write_off(void);
 static void mmio_write(uint32_t offset, uint8_t *data, uint32_t len);
@@ -72,6 +74,7 @@ static void mmio_write(uint32_t offset, uint8_t *data, uint32_t len);
 TaskHandle_t ether_handle;
 static volatile uint32_t rx_size = 0;
 static uint8_t rx_buf[0x100000];
+static uint8_t reply_buf[0x30];
 
 BaseType_t xNetworkInterfaceInitialise(void)
 {
@@ -107,10 +110,14 @@ BaseType_t xGetPhyLinkStatus(struct xNetworkInterface *pxInterface)
     return pdTRUE;
 }
 
+uint32_t random_magic = 0x01010101;
+uint32_t random_count = 0;
 BaseType_t xApplicationGetRandomNumber(uint32_t *pulNumber)
 {
     d("");
-    return *pulNumber + 1;
+
+    *pulNumber = random_magic << (random_count++ % 8);
+    return pdTRUE;
 }
 uint32_t ulApplicationGetNextSequenceNumber(uint32_t ulSourceAddress,
                                             uint16_t usSourcePort,
@@ -207,38 +214,96 @@ static void ether_task(void *param)
     IPStackEvent_t ev;
     BaseType_t status;
     volatile uint32_t size;
+    eFrameProcessingResult_t consider;
 
     (void)param;
 
     rx_ether_smph = xSemaphoreCreateBinary();
-    d("smph:%p", rx_ether_smph);
+    d("smph:%p off:%x", rx_ether_smph, (uint8_t *)&descriptor->pucEthernetBuffer - (uint8_t *)descriptor);
     for (;;)
     {
         if (xSemaphoreTake(rx_ether_smph, portMAX_DELAY))
         {
             size = rx_size;
-            d("be waken sz:%d", size);
+            d("be waken sz:%lu", size);
             if (!size)
                 continue;
 
-            descriptor = pxGetNetworkBufferWithDescriptor(sizeof(ARPPacket_t), 0);
+//            if (is_arp_request(rx_buf, size))
+//            {
+//                arp_reply(rx_buf, size);
+//            }
+
+            descriptor = pxGetNetworkBufferWithDescriptor(size, 0);
             if (descriptor)
             {
                 descriptor->pucEthernetBuffer = (uint8_t *)rx_buf;
                 descriptor->xDataLength = size;
-                ev.pvData = descriptor;
-                ev.eEventType = eNetworkRxEvent;
-                status = xSendEventStructToIPTask(&ev, 0);
-                rx_size = 0;
-                d("xSendEventStructToIPTask:%ld sz:%lu", status, size);
+                consider = eConsiderFrameForProcessing(descriptor->pucEthernetBuffer);
+                if (consider == eProcessBuffer)
+                {
+                    ev.pvData = descriptor;
+                    ev.eEventType = eNetworkRxEvent;
+                    status = xSendEventStructToIPTask(&ev, 0);
+                    rx_size = 0;
+                    d("rx data to stack:%ld sz:%lu data:\n%s", status, size, b2s(rx_buf, size));
+                }
+                else
+                {
+                    d("consider:%d", consider);
+                }
             }
             else
             {
                 d("descriptor is null");
             }
+            vReleaseNetworkBufferAndDescriptor(descriptor);
         }
     }
 }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+static bool is_arp_request(uint8_t *data, size_t len)
+{
+    (void)len;
+    EthernetHeader_t *eth = (EthernetHeader_t *)data;
+    ARPHeader_t *arp = (ARPHeader_t *)&eth[1];
+
+    return eth->usFrameType == 0x0608 && arp->usOperation == 0x0100;
+}
+
+static void arp_reply(uint8_t *data, size_t len)
+{
+    EthernetHeader_t *eth = (EthernetHeader_t *)data;
+    ARPHeader_t *arp = (ARPHeader_t *)&eth[1];
+    MACAddress_t mac;
+    IP_Address_t ip;
+    MACAddress_t tomac = eth->xSourceAddress;
+    IP_Address_t toip = *(IP_Address_t *)arp->ucSenderProtocolAddress;
+
+    NetworkEndPoint_t *ep = FreeRTOS_FirstEndPoint(NULL);
+    if (ep)
+    {
+        ip = *(IP_Address_t *)&ep->ipv4_defaults.ulIPAddress;
+        mac = ep->xMACAddress;
+        eth = (EthernetHeader_t *)reply_buf;
+        arp = (ARPHeader_t *)&eth[1];
+
+        eth->xDestinationAddress = tomac;
+        eth->xSourceAddress = mac;
+        arp->usOperation = 0x0200;
+        arp->xSenderHardwareAddress = mac;
+        *(IP_Address_t *)arp->ucSenderProtocolAddress = ip;
+        arp->xTargetHardwareAddress = tomac;
+        *(IP_Address_t*)&arp->ulTargetProtocolAddress = toip;
+        mmio_write_on();
+        *TX_SIZE = len;
+        mmio_write(0, (uint8_t *)reply_buf, len);
+        mmio_write_off();
+    }
+}
+#pragma GCC diagnostic pop
 
 /* MMIO */
 #define WRITE_MMIO_REG 0x28000000
